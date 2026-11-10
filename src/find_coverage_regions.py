@@ -12,10 +12,7 @@ import csv
 from contextlib import ExitStack
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-from astropy.io import fits
-from matplotlib.patches import Rectangle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +26,10 @@ def parse_args():
     parser.add_argument("--max-regions", type=int, default=20)
     parser.add_argument("--min-coverage", type=float, default=0.98)
     parser.add_argument("--min-spacing", type=int, default=512)
+    parser.add_argument("--output", type=Path,
+                        default=ROOT / "data" / "processed" / "coverage_regions.csv")
+    parser.add_argument("--map-output", type=Path,
+                        default=ROOT / "results" / "coverage_map.png")
     return parser.parse_args()
 
 
@@ -44,8 +45,57 @@ def choose_files(folder):
     return selected
 
 
+def select_spread_regions(candidates, max_regions, min_spacing):
+    """Choose high-coverage, spatially dispersed tiles deterministically.
+
+    Candidates have (coverage, x0, y0). The initial tile is closest to the
+    candidate centroid among those with maximum coverage; later tiles maximize
+    distance to their nearest already-selected tile.
+    """
+    if max_regions < 1 or min_spacing < 0:
+        raise ValueError("max_regions must be positive and min_spacing nonnegative")
+    if not candidates:
+        return []
+
+    items = np.asarray(candidates, dtype=float)
+    positions = items[:, 1:3]
+    highest_coverage = np.max(items[:, 0])
+    equally_covered = np.flatnonzero(items[:, 0] == highest_coverage)
+    center = positions.mean(axis=0)
+    first = int(min(equally_covered, key=lambda i: (
+        np.sum((positions[i] - center) ** 2),
+        items[i, 2], items[i, 1],
+    )))
+
+    selected_indices = [first]
+    available = np.ones(len(items), dtype=bool)
+    available[first] = False
+    nearest_squared = np.sum((positions - positions[first]) ** 2, axis=1)
+
+    while len(selected_indices) < max_regions:
+        eligible = np.flatnonzero(available & (nearest_squared >= min_spacing ** 2))
+        if not len(eligible):
+            break
+        # Stable tie breaks: higher coverage, then smaller y and x.
+        idx = min(eligible, key=lambda i: (
+            -nearest_squared[i], -items[i, 0], items[i, 2], items[i, 1]
+        ))
+        selected_indices.append(int(idx))
+        available[idx] = False
+        nearest_squared = np.minimum(
+            nearest_squared, np.sum((positions - positions[idx]) ** 2, axis=1)
+        )
+
+    return [candidates[i] for i in selected_indices]
+
+
 def main():
     args = parse_args()
+
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+    from matplotlib.patches import Rectangle
+
     if args.size <= 0 or args.size % COARSE_STEP:
         raise ValueError(f"--size must be a positive multiple of {COARSE_STEP}")
     if not (0 < args.min_coverage <= 1):
@@ -91,22 +141,12 @@ def main():
                 if fraction >= args.min_coverage:
                     candidates.append((fraction, x0, y0))
 
-    # Prefer high-coverage regions while distributing them over the field.
-    candidates.sort(key=lambda item: (-item[0], item[2], item[1]))
-    selected = []
-    for fraction, x0, y0 in candidates:
-        if all(
-            (x0 - old_x) ** 2 + (y0 - old_y) ** 2 >= args.min_spacing ** 2
-            for _, old_x, old_y in selected
-        ):
-            selected.append((fraction, x0, y0))
-            if len(selected) >= args.max_regions:
-                break
+    selected = select_spread_regions(candidates, args.max_regions, args.min_spacing)
 
     if not selected:
         raise RuntimeError("No shared-coverage regions found. Try --min-coverage 0.90")
 
-    output_csv = ROOT / "data" / "processed" / "coverage_regions.csv"
+    output_csv = args.output
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
@@ -133,7 +173,7 @@ def main():
     ax.set_ylabel(f"y / {COARSE_STEP} pixels")
     fig.tight_layout()
 
-    output_png = ROOT / "results" / "coverage_map.png"
+    output_png = args.map_output
     output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_png, dpi=150)
     plt.close(fig)

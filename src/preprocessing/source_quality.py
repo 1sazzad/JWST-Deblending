@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_COLUMNS = (
     "region_id", "source_label", "x_local", "y_local",
     "x_global", "y_global", "area_pixels",

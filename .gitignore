@@ -46,3 +46,7 @@ jwst_refactor_bundle.zip
 Thumbs.db
 .DS_Store
 *.log
+
+
+# Isolated environment for scarlet2 baseline experiments
+.venv-scarlet2/

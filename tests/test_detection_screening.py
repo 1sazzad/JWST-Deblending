@@ -7,9 +7,15 @@ from pathlib import Path
 import numpy as np
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# Add the project root to Python's module search path
+# so tests can import the reorganized source packages.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from detect_sources import count_segment_peaks, edge_distance
+# Import source detection and screening utilities.
+from src.preprocessing.detect_sources import (
+    count_segment_peaks,
+    edge_distance
+)
 
 
 class DetectionScreeningTests(unittest.TestCase):

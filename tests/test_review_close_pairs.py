@@ -8,9 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# Add the project root to Python's module search path
+# so tests can import the reorganized source packages.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from review_close_pairs import find_close_pairs, get_region_catalog, save_pair_figure
+# Import close-pair analysis and visualization functions.
+from src.visualization.review_close_pairs import (
+    find_close_pairs,
+    get_region_catalog,
+    save_pair_figure
+)
 
 
 def row(region, label, x, y, flag="close_neighbor"):

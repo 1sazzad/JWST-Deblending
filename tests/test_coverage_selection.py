@@ -5,9 +5,12 @@ import unittest
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# Add the project root to Python's module search path
+# so tests can import the reorganized source packages.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from find_coverage_regions import select_spread_regions
+# Import coverage selection from the preprocessing package.
+from src.preprocessing.find_coverage_regions import select_spread_regions
 
 
 class CoverageSelectionTests(unittest.TestCase):

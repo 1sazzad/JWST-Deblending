@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BANDS = ("f150w", "f277w", "f444w")
 COARSE_STEP = 16
 

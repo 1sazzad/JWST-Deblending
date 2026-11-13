@@ -9,9 +9,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# Add the project root to Python's module search path
+# so tests can import the reorganized source packages.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from source_quality import (QualityCriteria, assess_sources, main, read_csv,
+# Import source quality assessment utilities.
+from src.preprocessing.source_quality import (QualityCriteria, assess_sources, main, read_csv,
                             read_region_sizes, write_quality_csv)
 
 

@@ -16,7 +16,7 @@ from itertools import combinations
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def find_close_pairs(rows, maximum_distance=12.0):
@@ -142,7 +142,13 @@ def main(argv=None):
         print("No close-neighbor pairs in the quality catalog")
         return
 
-    from detect_sources import BANDS, get_band_files, read_region
+        # Reuse source detection utilities to maintain consistent
+    # filter selection and image cutout extraction.
+    from src.preprocessing.detect_sources import (
+        BANDS,
+        get_band_files,
+        read_region
+    )
     regions = get_region_catalog(args.regions)
     paths = get_band_files()
 

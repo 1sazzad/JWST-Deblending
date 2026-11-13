@@ -9,13 +9,14 @@ The output is a detection catalog, NOT a verified galaxy or blend catalog.
 
 import argparse
 import csv
+from html import parser
 from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, label, maximum_filter
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BANDS = ("f150w", "f277w", "f444w")
 
 
@@ -36,6 +37,8 @@ def get_args():
                         help="Minimum local peak height in the exploratory SNR proxy")
     parser.add_argument("--min-peak-separation", type=int, default=4,
                         help="Minimum separation scale for distinct segment peaks, in pixels")
+    parser.add_argument("--inspect-region", help="Inspect one region without saving files")
+    parser.add_argument("--inspect-source", type=int, help="Source label to inspect")
     return parser.parse_args()
 
 
@@ -70,7 +73,7 @@ def edge_distance(x, y, size):
     return min(x, y, size - 1 - x, size - 1 - y)
 
 
-def count_segment_peaks(image, segment_mask, min_height=4.0, separation=4):
+def segment_peak_positions(image, segment_mask, min_height=4.0, separation=4):
     """Count distinct bright local maxima within one detected segment.
 
     Peaks are screening signals, not evidence of distinct galaxies.
@@ -94,7 +97,99 @@ def count_segment_peaks(image, segment_mask, min_height=4.0, separation=4):
         if all((x - px) ** 2 + (y - py) ** 2 >= separation ** 2
                for py, px in accepted):
             accepted.append((y, x))
-    return len(accepted)
+    return [(x, y) for y, x in accepted]
+
+def count_segment_peaks(image, segment_mask, min_height=4.0, separation=4):
+    return len(segment_peak_positions(
+        image, segment_mask, min_height, separation
+    ))
+    
+    
+def inspect_source(images, standardized, segments, smooth, args):
+    import matplotlib.pyplot as plt
+
+    if segments is None or args.inspect_source not in segments.labels:
+        raise ValueError(f"Source label {args.inspect_source} not detected")
+
+    mask = segments.data == args.inspect_source
+
+    combined_peaks = segment_peak_positions(
+        smooth,
+        mask,
+        args.peak_threshold,
+        args.min_peak_separation,
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    for ax, band, z in zip(axes, BANDS, standardized):
+        image = images[band]
+        finite = image[np.isfinite(image)]
+
+        lo, hi = np.percentile(finite, (5, 99.5)) if finite.size else (0, 1)
+
+        if hi <= lo:
+            hi = lo + 1
+
+        ax.imshow(
+            image,
+            origin="lower",
+            cmap="gray",
+            vmin=lo,
+            vmax=hi,
+        )
+
+        # Yellow: actual combined-detection segmentation boundary.
+        ax.contour(
+            mask.astype(float),
+            levels=[0.5],
+            colors="yellow",
+            linewidths=1,
+        )
+
+        # Find local peaks independently in this band.
+        band_map = gaussian_filter(z, sigma=1.0)
+
+        band_peaks = segment_peak_positions(
+            band_map,
+            mask,
+            min_height=2.0,
+            separation=args.min_peak_separation,
+        )
+
+        matched = 0
+
+        for i, (x, y) in enumerate(combined_peaks, start=1):
+            supported = any(
+                (x - bx) ** 2 + (y - by) ** 2 <= 9
+                for bx, by in band_peaks
+            )
+
+            matched += supported
+
+            ax.scatter(
+                x, y,
+                s=75,
+                facecolors="none",
+                edgecolors="lime" if supported else "magenta",
+                linewidths=1.6,
+            )
+
+            ax.text(x + 2, y + 2, str(i), color="white", fontsize=8)
+
+        ax.set_title(
+            f"{band.upper()} ({matched}/{len(combined_peaks)} supported)"
+        )
+
+    fig.suptitle(
+        f"{args.inspect_region} | Source {args.inspect_source}"
+    )
+
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+    print("Peak correspondence is exploratory, not confirmed galaxy separation.")
 
 
 def main():
@@ -109,12 +204,26 @@ def main():
             or args.peak_threshold <= 0 or not np.isfinite(args.peak_threshold)
             or args.min_peak_separation < 1):
         raise ValueError("Invalid edge or peak screening settings")
+    if bool(args.inspect_region) != (args.inspect_source is not None):
+        raise ValueError("--inspect-region and --inspect-source must be used together")
 
+    if args.inspect_source is not None and args.inspect_source < 1:
+        raise ValueError("--inspect-source must be positive")
+    
     region_csv = args.regions
     with region_csv.open(newline="", encoding="utf-8") as stream:
         regions = list(csv.DictReader(stream))
     if not regions:
         raise RuntimeError("coverage_regions.csv has no regions")
+    if args.inspect_region:
+        regions = [
+            r for r in regions
+            if r["region_id"] == args.inspect_region
+        ]
+
+    if len(regions) != 1:
+        raise ValueError(f"Region not found: {args.inspect_region}")
+    
 
     files = get_band_files()
     detected = []
@@ -152,6 +261,9 @@ def main():
             smooth, threshold=args.threshold, n_pixels=args.min_pixels,
             mask=~shared_valid,
         )
+        if args.inspect_region:
+            inspect_source(images, standardized, segments, smooth, args)
+            return
         centroids = []
         if segments is not None:
             catalog = SourceCatalog(np.maximum(smooth, 0), segments, mask=~shared_valid)

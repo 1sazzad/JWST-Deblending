@@ -33,6 +33,8 @@ from src.simulation.psf_utils import (
     BANDS
 )
 
+from functools import partial
+from scipy.special import gammaincinv
 
 # ---------------------------------------------------------
 # Experimental configuration
@@ -110,12 +112,146 @@ def gaussian_galaxy(
     return galaxy / galaxy.sum()
 
 
+def sersic_galaxy(
+    size,
+    x0,
+    y0,
+    sigma_x,
+    sigma_y,
+    angle,
+    *,
+    n,
+    oversample=8
+):
+    """
+    Generate a pixel-integrated elliptical Sersic profile.
+
+    Parameters
+    ----------
+    size : int
+        Spatial dimensions of the square simulation canvas.
+    x0, y0 : float
+        Galaxy center in pixel coordinates.
+    sigma_x, sigma_y : float
+        Existing Gaussian morphology scales used to define
+        comparable Sersic effective-radius scales.
+    angle : float
+        Galaxy rotation angle in degrees.
+    n : float
+        Sersic index controlling radial concentration.
+    oversample : int
+        Number of subpixel samples along each pixel axis.
+
+    Returns
+    -------
+    numpy.ndarray
+        Non-negative galaxy morphology normalized to unit
+        integrated flux over the finite simulation canvas.
+
+    Notes
+    -----
+    Subpixel integration improves numerical accuracy near
+    the steep central intensity peak of high-index profiles.
+    """
+
+    # Validate physical and numerical parameters.
+    parameters = [
+        x0, y0, sigma_x, sigma_y, angle, n
+    ]
+
+    if not np.all(np.isfinite(parameters)):
+        raise ValueError("Non-finite Sersic parameters")
+
+    if min(sigma_x, sigma_y, n) <= 0:
+        raise ValueError("Invalid morphology parameters")
+
+    if size < 1 or oversample < 1:
+        raise ValueError("Invalid sampling configuration")
+
+    # Construct the native pixel-coordinate grid.
+    y, x = np.indices(
+        (size, size),
+        dtype=np.float64
+    )
+
+    # Convert the position angle to radians.
+    theta = np.deg2rad(angle)
+
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    # Compute the exact Sersic normalization constant.
+    bn = gammaincinv(2.0 * n, 0.5)
+
+    # Match the effective-radius scale to that of the
+    # corresponding Gaussian morphology.
+    radius_scale = np.sqrt(2.0 * np.log(2.0))
+
+    # Generate uniformly spaced subpixel coordinates.
+    offsets = (
+        (np.arange(oversample) + 0.5)
+        / oversample
+        - 0.5
+    )
+
+    profile = np.zeros(
+        (size, size),
+        dtype=np.float64
+    )
+
+    # Integrate the surface brightness within each pixel.
+    # Process one subpixel offset at a time to limit RAM use.
+    for dy in offsets:
+
+        for dx in offsets:
+
+            x_shifted = x + dx - x0
+            y_shifted = y + dy - y0
+
+            # Rotate coordinates into the galaxy frame.
+            u = (
+                x_shifted * cos_theta
+                + y_shifted * sin_theta
+            )
+
+            v = (
+                -x_shifted * sin_theta
+                + y_shifted * cos_theta
+            )
+
+            # Calculate the dimensionless elliptical radius.
+            radius = np.hypot(
+                u / sigma_x,
+                v / sigma_y
+            ) / radius_scale
+
+            # Evaluate the Sersic surface brightness.
+            # The constant amplitude cancels during
+            # integrated-flux normalization.
+            profile += np.exp(
+                -bn * radius ** (1.0 / n)
+            )
+
+    # Average the subpixel intensity samples.
+    profile /= oversample ** 2
+
+    # Normalize the finite-canvas integrated flux.
+    total = profile.sum()
+
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("Invalid integrated Sersic intensity")
+
+    profile /= total
+
+    return profile
+
 def simulate_scene(
     positions=None,
     true_flux=None,
     noise_sigma=None,
     morphology=None,
-    seed=RANDOM_SEED
+    seed=RANDOM_SEED,
+    sersic_n=None
 ):
     """
     Generate a configurable multi-band synthetic galaxy scene.
@@ -145,6 +281,38 @@ def simulate_scene(
 
     Default parameters reproduce the original pilot scene.
     """
+    
+    # Preserve the original Gaussian simulation by default.
+    # Enable Sersic morphology only when explicitly requested.
+    if sersic_n is None:
+
+        profile_generator = gaussian_galaxy
+
+    else:
+
+        if not np.isfinite(sersic_n) or sersic_n <= 0:
+            raise ValueError(
+                "Sersic index must be finite and positive."
+            )
+
+                # Select the subpixel integration resolution
+        # according to the Sersic profile concentration.
+        #
+        # High-index profiles require finer sampling
+        # because of their steep central intensity peaks.
+        #
+        # Resolution choices are informed by the
+        # numerical convergence experiments.
+
+        sampling_resolution = (
+            8 if sersic_n <= 2.0 else 32
+        )
+
+        profile_generator = partial(
+            sersic_galaxy,
+            n=float(sersic_n),
+            oversample=sampling_resolution
+        )
 
     # Preserve the original pilot configuration when
     # no custom experimental parameters are supplied.
@@ -224,7 +392,7 @@ def simulate_scene(
 
         sx, sy, angle = morphology[i]
 
-        profile = gaussian_galaxy(
+        profile = profile_generator(
             padded_size,
             x0 + PADDING,
             y0 + PADDING,
@@ -273,13 +441,54 @@ def simulate_scene(
     if not np.all(np.isfinite(observed)):
         raise ValueError("Invalid simulated observation")
 
-    # Confirm that intrinsic source flux is preserved.
-    np.testing.assert_allclose(
-        intrinsic.sum(axis=(-2, -1)),
-        true_flux,
-        rtol=1e-8,
-        atol=1e-8
-    )
+        # Calculate integrated intrinsic flux inside the
+    # finite observation cutout.
+    intrinsic_flux = intrinsic.sum(axis=(-2, -1))
+
+    if sersic_n is None:
+
+        # Preserve the strict flux conservation check
+        # for the original Gaussian simulator.
+        np.testing.assert_allclose(
+            intrinsic_flux,
+            true_flux,
+            rtol=1e-8,
+            atol=1e-8
+        )
+
+    else:
+
+        # Extended Sersic wings may fall outside the
+        # observation cutout. Do not force the cropped
+        # flux to equal the full simulated source flux.
+        if not np.all(np.isfinite(intrinsic_flux)):
+            raise ValueError(
+                "Non-finite intrinsic flux detected."
+            )
+
+        if np.any(intrinsic_flux <= 0):
+            raise ValueError(
+                "Non-positive intrinsic flux detected."
+            )
+
+        # Cropping must not create additional flux.
+        if np.any(
+            intrinsic_flux > true_flux * (1 + 1e-8)
+        ):
+            raise ValueError(
+                "Unexpected intrinsic flux increase."
+            )
+
+        # Measure the fraction of input flux outside
+        # the observation cutout.
+        intrinsic_flux_loss = (
+            true_flux - intrinsic_flux
+        ) / true_flux
+
+        print(
+            "Maximum intrinsic flux loss: "
+            f"{intrinsic_flux_loss.max() * 100:.8f}%"
+        )
 
     return {
         "observed": observed,
@@ -293,6 +502,17 @@ def simulate_scene(
         "bands": np.array(BANDS),
         "noise_sigma": noise_sigma,
         "morphology": morphology,
+        "morphology_family": (
+            "gaussian"
+            if sersic_n is None
+            else "sersic"
+        ),
+
+        "sersic_n": (
+            0.5
+            if sersic_n is None
+            else float(sersic_n)
+        ),
         "seed": seed
     }
 

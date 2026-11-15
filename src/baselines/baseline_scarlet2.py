@@ -72,6 +72,26 @@ INITIAL_BOX_SIZE = 31
 #   "moments": Official Gaussian-moment initialization.
 #   "warm_start": Observation-based Gaussian initialization.
 INITIALIZATION_MODE = "warm_start"
+# Prespecified amount of equal-share mixing for the initialization ablation.
+# A 10% mixture gives each of two sources at least 5% of the band total
+# (before source placement), while preserving the total estimated spectrum.
+INITIALIZATION_MIX = 0.10
+
+
+def balance_initial_spectra(spectra, fraction=INITIALIZATION_MIX):
+    """Mix the observation-based spectra with an equal-share allocation.
+
+    This changes only the initial flux allocation, not the morphology, PSFs,
+    or optimizer. The input has shape (source, band). No truth is used.
+    """
+    values = np.asarray(spectra)
+    if (values.ndim != 2 or values.shape[0] < 1
+            or not np.all(np.isfinite(values)) or np.any(values <= 0)):
+        raise ValueError("Expected finite positive initial spectra")
+    if not 0 <= fraction <= 1:
+        raise ValueError("Initialization mixture must lie in [0, 1]")
+    equal_share = values.mean(axis=0, keepdims=True)
+    return (1 - fraction) * values + fraction * equal_share
 
 
 # Enable or disable neural morphology regularization
@@ -86,7 +106,7 @@ PRIOR_MODEL_NAME = "hsc32"
 PRIOR_TEMPERATURE = 0.01
 
 def initialize_from_baseline(
-    observed, psfs, positions, noise_sigma
+    observed, psfs, positions, noise_sigma, box_size=INITIAL_BOX_SIZE
 ):
     """
     Initialize scarlet2 using observation-based flux
@@ -119,7 +139,7 @@ def initialize_from_baseline(
 
     # Construct a generic centered Gaussian morphology.
     # Use the same spatial support for every source.
-    size = INITIAL_BOX_SIZE
+    size = box_size
 
     y, x = np.indices((size, size), dtype=np.float64)
 
@@ -169,7 +189,10 @@ def fit_scarlet2(
     noise_sigma,
     bands,
     use_neural_prior=USE_NEURAL_PRIOR,
-    max_iterations=MAX_ITERATIONS
+    max_iterations=MAX_ITERATIONS,
+    initialization_mode=INITIALIZATION_MODE,
+    collect_diagnostics=False,
+    box_size=INITIAL_BOX_SIZE
 ):
     """
     Fit a multi-band galaxy scene using scarlet2.
@@ -189,6 +212,15 @@ def fit_scarlet2(
 
         bands:
             Ordered list of photometric filter names.
+        initialization_mode:
+            "warm_start" (unchanged default), "balanced_warm_start" (10%
+            equal-share mixing), or the existing "moments" initialization.
+        collect_diagnostics:
+            Record convergence and flux/morphology summaries using the official
+            scarlet2 callback. Does not change the objective or update rule.
+        box_size:
+            Odd spatial support for each source. Default 31 preserves the
+            existing baseline; larger boxes are for vanilla scarlet2 only.
 
     Returns:
         estimated_flux:
@@ -245,36 +277,51 @@ def fit_scarlet2(
 
         # Prepare observation-based initial flux estimates
     # when the warm-start strategy is selected.
-    if INITIALIZATION_MODE == "warm_start":
+    if initialization_mode not in ("warm_start", "balanced_warm_start", "moments"):
+        raise ValueError("Unsupported initialization mode")
+    if not isinstance(box_size, (int, np.integer)) or box_size < 3 or box_size % 2 != 1:
+        raise ValueError("box_size must be an odd integer >= 3")
+    if use_neural_prior and box_size != INITIAL_BOX_SIZE:
+        raise ValueError("Larger boxes are not validated for the HSC32 prior")
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be positive")
+    warm_start_flux = None
+    if initialization_mode in ("warm_start", "balanced_warm_start"):
 
         initial_spectra, initial_morphology = (
             initialize_from_baseline(
                 observed,
                 psfs,
                 positions,
-                noise_sigma
+                noise_sigma,
+                box_size=box_size
             )
         )
 
-    print(f"Initialization mode: {INITIALIZATION_MODE}")
+        if collect_diagnostics:
+            warm_start_flux = np.asarray(initial_spectra) * float(initial_morphology.sum())
+        if initialization_mode == "balanced_warm_start":
+            initial_spectra = jnp.asarray(balance_initial_spectra(initial_spectra))
+
+    print(f"Initialization mode: {initialization_mode} | Support: {box_size}x{box_size}")
 
     # Initialize each galaxy independently.
     with sc2.Scene(model_frame) as scene:
 
         for index, center in enumerate(centers):
 
-            if INITIALIZATION_MODE == "warm_start":
+            if initialization_mode in ("warm_start", "balanced_warm_start"):
 
                 spectrum = initial_spectra[index]
                 morphology = initial_morphology.copy()
 
-            elif INITIALIZATION_MODE == "moments":
+            elif initialization_mode == "moments":
 
                 spectrum, morphology = (
                     sc2.init.from_gaussian_moments(
                         observation,
                         center,
-                        box_sizes=[INITIAL_BOX_SIZE]
+                        box_sizes=[box_size]
                     )
                 )
 
@@ -313,6 +360,12 @@ def fit_scarlet2(
             f"Source {index + 1} bounding box: "
             f"{source.bbox}"
         )
+
+    initial_flux = None
+    if collect_diagnostics:
+        initial_flux = np.stack([
+            np.asarray(sc2.measure.flux(source)) for source in scene.sources
+        ])
 
     # Record the goodness of fit before optimization.
     initial_chi2 = float(
@@ -420,15 +473,26 @@ def fit_scarlet2(
 
     print("\nStarting scarlet2 optimization...", flush=True)
 
+    # Record the same convergence statistic used by scarlet2 0.5.1.
+    trace = []
+
+    def record_iteration(current_scene, convergence, loss):
+        max_change = float(jax.tree_util.tree_reduce(lambda a, b: max(a, b), convergence))
+        trace.append((float(loss), max_change))
+
+    fit_options = {"callback": record_iteration} if collect_diagnostics else {}
+
     # Jointly optimize all sources across all filters.
     fitted_scene = scene.fit(
         observation,
         # Use the requested optimization budget.
         max_iter=max_iterations,
-        e_rel=RELATIVE_TOLERANCE
+        e_rel=RELATIVE_TOLERANCE,
+        **fit_options
     )
     
     print("\n--- Fitted Morphology Diagnostics ---")
+    morphology_stats = []
 
     for index, source in enumerate(fitted_scene.sources):
 
@@ -467,6 +531,35 @@ def fit_scarlet2(
         print(f"Negative pixels: {negative_count}")
         print(f"Peak offset: {peak_offset:.4f} pixels")
 
+        if collect_diagnostics:
+            # Raw morphology coordinates are relative to the box center.
+            # Use positive weights to avoid cancellation by negative pixels.
+            positive = np.maximum(morphology.astype(float), 0)
+            total_abs = np.abs(morphology.astype(float)).sum()
+            negative_mass = np.maximum(-morphology.astype(float), 0).sum()
+            yy, xx = np.indices(morphology.shape)
+            centroid_offset = None
+            if positive.sum() > 0:
+                cy = (yy * positive).sum() / positive.sum()
+                cx = (xx * positive).sum() / positive.sum()
+                centroid_offset = float(np.hypot(cy - center_y, cx - center_x))
+            # Record the actual model-frame bounding box and edge mass.
+            # Edge mass uses raw positive morphology, not intrinsic truth.
+            edge = np.ones(morphology.shape, dtype=bool)
+            edge[2:-2, 2:-2] = False
+            bbox = source.bbox
+            morphology_stats.append({
+                "bbox_height": int(bbox.shape[-2]),
+                "bbox_width": int(bbox.shape[-1]),
+                "bbox_y": int(bbox.origin[-2]),
+                "bbox_x": int(bbox.origin[-1]),
+                "edge_positive_mass_fraction": (float(positive[edge].sum() / positive.sum())
+                                                if positive.sum() > 0 else None),
+                "peak_offset_px": float(peak_offset),
+                "positive_centroid_offset_px": centroid_offset,
+                "negative_mass_fraction": float(negative_mass / total_abs) if total_abs > 0 else None,
+            })
+
     # Measure integrated source flux in the model frame.
     # Do not use the spectrum amplitude alone because
     # the morphology may not have a unit integrated sum.
@@ -496,6 +589,30 @@ def fit_scarlet2(
         "initial_chi2": initial_chi2,
         "final_chi2": final_chi2
     }
+
+    if collect_diagnostics:
+        if not trace or not np.all(np.isfinite(trace)):
+            raise RuntimeError("Missing or nonfinite convergence trace")
+        if not np.all(np.isfinite(initial_flux)):
+            raise RuntimeError("Nonfinite initial model flux")
+        last_change = trace[-1][1]
+        if last_change < RELATIVE_TOLERANCE:
+            stopping_reason = "relative_tolerance"
+        elif len(trace) == max_iterations:
+            stopping_reason = "iteration_limit"
+        else:
+            stopping_reason = "unexpected_early_stop"
+        diagnostics.update({
+            "warm_start_flux": warm_start_flux,
+            "initial_flux": initial_flux,
+            "iterations": len(trace),
+            "stopping_reason": stopping_reason,
+            "first_loss": trace[0][0],
+            "last_loss": trace[-1][0],
+            "last_max_change": last_change,
+            "morphology_stats": morphology_stats,
+            "trace": trace,
+        })
 
     return estimated_flux, reconstruction, diagnostics
 

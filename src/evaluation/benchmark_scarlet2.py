@@ -16,6 +16,12 @@ Failed measurements are retained in the output CSV.
 Fresh runs require a new output path or explicit --fresh.
 Resume validates existing records and skips complete experiments.
 Each experiment is committed with an atomic CSV replacement.
+
+Morphology extension:
+    Gaussian retains the original CSV format and output path.
+    Sersic n=1, 2 and 4 use separate CSV files with morphology,
+    visible-flux and intrinsic-support diagnostics. The n=4
+    experiment is explicitly labeled as a stress test.
 """
 
 import argparse
@@ -54,6 +60,15 @@ OUTPUT_PATH = (
     PROJECT_ROOT / "results/benchmark_scarlet2.csv"
 )
 
+# Separate files prevent one morphology run from overwriting another.
+MORPHOLOGY_CONFIG = {
+    "gaussian": (None, "main", None),
+    "sersic1": (1.0, "main", 8),
+    "sersic2": (2.0, "main", 8),
+    "sersic4": (4.0, "stress", 32),
+}
+SUPPORT_SIZES = (31, 49, 65)
+
 MAX_ITERATIONS = 1000
 
 METHODS = (
@@ -79,6 +94,84 @@ FIELDS = [
     "status",
     "failure_reason"
 ]
+
+
+# Keep the original Gaussian checkpoint schema unchanged.
+SERSIC_FIELDS = FIELDS + [
+    "morphology", "sersic_n", "track", "sampling_resolution",
+    "visible_flux", "support_31_fraction", "support_49_fraction",
+    "support_65_fraction"
+]
+
+
+def output_path_for(morphology):
+    """Return an isolated checkpoint path for each morphology family."""
+    if morphology == "gaussian":
+        return OUTPUT_PATH
+    return OUTPUT_PATH.with_name(f"benchmark_scarlet2_{morphology}.csv")
+
+
+def fields_for(morphology):
+    """Preserve compatibility with the previously generated Gaussian CSV."""
+    return FIELDS if morphology == "gaussian" else SERSIC_FIELDS
+
+
+def scene_diagnostics(scene, morphology):
+    """
+    Compute evaluation-only intrinsic support and visible-flux diagnostics.
+
+    Reuse the visualization module's illustrative centered-box definition.
+    Fractions use input flux on the finite simulation canvas as denominator.
+    The boxes are not exact scarlet2 internal bounding boxes.
+    These ground-truth diagnostics must never be passed to the fitters.
+    """
+    if morphology == "gaussian":
+        return {}
+
+    from src.visualization.visualize_morphologies import (
+        calculate_support_fraction
+    )
+
+    n, track, sampling = MORPHOLOGY_CONFIG[morphology]
+    # Older local simulator revisions may omit optional metadata.
+    # When present, verify it rather than silently accepting a mismatch.
+    if ("morphology_family" in scene and scene["morphology_family"] != "sersic"
+        or "sersic_n" in scene and float(scene["sersic_n"]) != n):
+        raise ValueError("Simulator morphology metadata does not match request")
+
+    diagnostics = {}
+    for source, position in enumerate(scene["positions"]):
+        for band_index, band in enumerate(scene["bands"]):
+            truth = float(scene["input_flux"][source, band_index])
+            visible = float(scene["visible_flux"][source, band_index])
+            if not np.isfinite(truth) or truth <= 0:
+                raise ValueError("Invalid diagnostic input flux")
+            if not np.isfinite(visible) or not 0 < visible <= truth * (1 + 1e-6):
+                raise ValueError("Invalid visible flux")
+            fractions = [
+                calculate_support_fraction(
+                    scene["intrinsic"][source, band_index], position,
+                    size, truth
+                )
+                for size in SUPPORT_SIZES
+            ]
+            if (
+                not all(np.isfinite(v) and 0 <= v <= 1 + 1e-6 for v in fractions)
+                or any(a > b + 1e-8 for a, b in zip(fractions, fractions[1:]))
+            ):
+                raise ValueError("Invalid intrinsic support fractions")
+
+            diagnostics[(source + 1, str(band).upper())] = {
+                "morphology": morphology,
+                "sersic_n": n,
+                "track": track,
+                "sampling_resolution": sampling,
+                "visible_flux": visible,
+                **{f"support_{size}_fraction": float(value)
+                   for size, value in zip(SUPPORT_SIZES, fractions)}
+            }
+
+    return diagnostics
 
 
 def fit_method(scene, method):
@@ -343,7 +436,7 @@ EXPECTED_MEASUREMENTS = {
 }
 
 
-def save_results(rows, path):
+def save_results(rows, path, fields=FIELDS):
     """
     Commit the complete CSV atomically.
 
@@ -367,7 +460,7 @@ def save_results(rows, path):
             delete=False
         ) as file:
             temporary_path = Path(file.name)
-            writer = csv.DictWriter(file, fieldnames=FIELDS)
+            writer = csv.DictWriter(file, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
             file.flush()
@@ -383,7 +476,7 @@ def save_results(rows, path):
             temporary_path.unlink()
 
 
-def load_existing_results(path, selected):
+def load_existing_results(path, selected, morphology="gaussian"):
     """
     Restore a checkpoint and validate its measurement identities.
 
@@ -405,7 +498,7 @@ def load_existing_results(path, selected):
     with path.open("r", newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
 
-        if reader.fieldnames != FIELDS:
+        if reader.fieldnames != fields_for(morphology):
             raise ValueError("Unexpected benchmark CSV structure")
 
         for row in reader:
@@ -471,6 +564,32 @@ def load_existing_results(path, selected):
             else:
                 raise ValueError(f"Unknown saved status: {key}")
 
+            if morphology != "gaussian":
+                n, track, sampling = MORPHOLOGY_CONFIG[morphology]
+                if (
+                    row["morphology"] != morphology
+                    or float(row["sersic_n"]) != n
+                    or row["track"] != track
+                    or int(row["sampling_resolution"]) != sampling
+                ):
+                    raise ValueError(f"Saved morphology configuration mismatch: {key}")
+                row["sersic_n"] = n
+                row["sampling_resolution"] = sampling
+                row["visible_flux"] = float(row["visible_flux"])
+                if (not np.isfinite(row["visible_flux"])
+                    or not 0 < row["visible_flux"] <= row["true_flux"] * (1 + 1e-6)):
+                    raise ValueError(f"Invalid saved visible flux: {key}")
+                fractions = []
+                for size in SUPPORT_SIZES:
+                    field = f"support_{size}_fraction"
+                    row[field] = float(row[field])
+                    fractions.append(row[field])
+                if (
+                    not all(np.isfinite(v) and 0 <= v <= 1 + 1e-6 for v in fractions)
+                    or any(a > b + 1e-8 for a, b in zip(fractions, fractions[1:]))
+                ):
+                    raise ValueError(f"Invalid saved support fractions: {key}")
+
             grouped.setdefault(key, []).append(row)
             rows.append(row)
 
@@ -513,8 +632,17 @@ def main():
         help="Continue the full benchmark without repeating saved experiments."
     )
 
+    parser.add_argument(
+        "--morphology", choices=tuple(MORPHOLOGY_CONFIG), default="gaussian",
+        help="Choose the matched Gaussian or Sersic morphology family."
+    )
+
     # Register all arguments before parsing.
     args = parser.parse_args()
+    morphology = args.morphology
+    sersic_n, track, sampling = MORPHOLOGY_CONFIG[morphology]
+    output_path = output_path_for(morphology)
+    fields = fields_for(morphology)
 
     # Keep the original scene IDs and seeds of the 100-scene benchmark.
     combinations = list(product(
@@ -536,6 +664,11 @@ def main():
     planned = len(selected) * len(METHODS)
     planned_measurements = planned * len(EXPECTED_MEASUREMENTS)
 
+    print(f"Morphology: {morphology} | Track: {track}", flush=True)
+    if sersic_n is not None:
+        print(f"Sersic n: {sersic_n} | Expected sampling: {sampling}x{sampling}", flush=True)
+    if not args.smoke:
+        print(f"Output: {output_path}", flush=True)
     print(f"Planned scenes: {len(selected)}", flush=True)
     print(f"Planned method-scene experiments: {planned}", flush=True)
     print(f"Planned flux measurements: {planned_measurements}", flush=True)
@@ -543,18 +676,18 @@ def main():
 
     if not args.smoke:
         if args.resume:
-            if not OUTPUT_PATH.exists():
-                parser.error(f"No checkpoint found: {OUTPUT_PATH}")
+            if not output_path.exists():
+                parser.error(f"No checkpoint found: {output_path}")
 
-            all_rows, completed = load_existing_results(OUTPUT_PATH, selected)
+            all_rows, completed = load_existing_results(output_path, selected, morphology)
             print(f"Restored measurements: {len(all_rows)}", flush=True)
             print(f"Completed experiments: {len(completed)}", flush=True)
         else:
-            if OUTPUT_PATH.exists() and not args.fresh:
+            if output_path.exists() and not args.fresh:
                 parser.error("CSV already exists. Use --resume or explicitly --fresh.")
 
             # A fresh run deliberately starts with a header-only CSV.
-            save_results([], OUTPUT_PATH)
+            save_results([], output_path, fields)
 
     try:
         for count, (scene_id, separation, ratio) in enumerate(
@@ -581,7 +714,12 @@ def main():
 
             # Generate each scene once; all pending methods share its input.
             config = create_configuration(separation, ratio, seed)
-            scene = simulate_scene(**config)
+            # Preserve the original call for Gaussian runs. Only the
+            # intrinsic morphology family changes in the Sersic runs.
+            if sersic_n is None:
+                scene = simulate_scene(**config)
+            else:
+                scene = simulate_scene(**config, sersic_n=sersic_n)
 
             # Validate the simulator's source/band layout before running fits.
             identities = {
@@ -592,6 +730,13 @@ def main():
             if identities != EXPECTED_MEASUREMENTS:
                 raise ValueError("Unexpected simulator source/band layout")
 
+            diagnostics = scene_diagnostics(scene, morphology)
+            if diagnostics:
+                worst_support = min(
+                    entry["support_31_fraction"] for entry in diagnostics.values()
+                )
+                print(f"Minimum intrinsic 31x31 support: {worst_support*100:.4f}%", flush=True)
+
             for method in pending:
                 print(
                     f"Running experiment {len(completed)+1}/{planned}: {method}",
@@ -601,10 +746,16 @@ def main():
                     scene, scene_id, seed, separation, ratio, method
                 )
 
+                # Store identical truth-side diagnostics for all methods.
+                # They are computed independently of each fitted result.
+                if diagnostics:
+                    for row in rows:
+                        row.update(diagnostics[(row["source"], row["band"].upper())])
+
                 # Commit the new complete experiment before marking it done.
                 updated_rows = all_rows + rows
                 if not args.smoke:
-                    save_results(updated_rows, OUTPUT_PATH)
+                    save_results(updated_rows, output_path, fields)
 
                 all_rows = updated_rows
                 completed.add((scene_id, method))
@@ -617,8 +768,8 @@ def main():
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user.", flush=True)
         if not args.smoke:
-            print(f"Committed results are saved in: {OUTPUT_PATH}", flush=True)
-            print("Use --resume to continue.", flush=True)
+            print(f"Committed results are saved in: {output_path}", flush=True)
+            print(f"Use --morphology {morphology} --resume to continue.", flush=True)
         # Do not print the normal completion summary for an interrupted run.
         raise SystemExit(130)
 
@@ -626,6 +777,17 @@ def main():
         raise RuntimeError("Final benchmark accounting mismatch")
 
     summarize_results(all_rows)
+    if morphology != "gaussian":
+        # Each source-band appears once per method; avoid triple counting.
+        unique = {(row["scene_id"], row["source"], row["band"].upper()): row
+                  for row in all_rows}
+        print("\n--- Intrinsic Support Summary (all recorded scenes) ---")
+        for size in SUPPORT_SIZES:
+            excluded = np.array([
+                1 - row[f"support_{size}_fraction"] for row in unique.values()
+            ]) * 100
+            print(f"{size}x{size}: mean excluded={excluded.mean():.6f}% | "
+                  f"max excluded={excluded.max():.6f}%")
     successful = sum(row["status"] == "success" for row in all_rows)
     print(f"\nCompleted experiments: {len(completed)}/{planned}")
     print(f"Recorded measurements: {len(all_rows)}/{planned_measurements}")
@@ -634,7 +796,7 @@ def main():
     print(f"Current invocation runtime: {perf_counter()-start:.2f}s")
 
     if not args.smoke:
-        print(f"Results saved: {OUTPUT_PATH}")
+        print(f"Results saved: {output_path}")
 
 
 if __name__ == "__main__":
